@@ -159,15 +159,6 @@ class simpleGraphConvolutionalignment(nn.Module):
         return outs, attss  # b,s,h
 
 
-def length2mask(length, maxlength):
-    size = list(length.size())
-    length = length.unsqueeze(-1).repeat(*([1] * len(size) + [maxlength])).long()
-    ran = torch.arange(maxlength).cuda()
-    ran = ran.expand_as(length)
-    mask = ran < length
-    return mask.float().cuda()
-
-
 class GraphConvolution(nn.Module):
     """
     Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
@@ -358,18 +349,28 @@ class mutualatt(nn.Module):
         self.linear2 = torch.nn.Linear(2 * hidden_size, hidden_size)
         self.linear1 = torch.nn.Linear(hidden_size, 1)
     
-    def forward(self, in1, text, textmask):
+    def forward(self, in1, text, mask):
         length = text.size(1)
         in1 = in1.unsqueeze(1).repeat(1, length, 1)
         att = self.linear1(torch.tanh(self.linear2(torch.cat([in1, text], -1)))).squeeze(-1)
-        #        print((1-textmask)*-1e20)
-        att = torch.softmax(att, -1) * textmask
+        att = torch.softmax(att, -1) * mask
         att = (att / (att.sum(-1, keepdim=True) + 1e-20)).unsqueeze(-2)
-        #        print(att.size())
-        #        print(text.size())
         #        att=torch.softmax(((1-textmask)*-1e20+att),-1).unsqueeze(1)
         context = torch.matmul(att, text).squeeze(1)
         return context, att
+
+
+def length2mask(lengths, max_length):
+    """
+    :param lengths: b
+    :param max_length:
+    :return: b * max_length
+    """
+    lengths = lengths.unsqueeze(-1).repeat([1] * lengths.dim() + [max_length]).long()
+    range = torch.arange(max_length).cuda()
+    range = range.expand_as(lengths)
+    mask = range < lengths
+    return mask.float().cuda()
 
 
 @Model.register("asbigcn")
@@ -395,7 +396,7 @@ class ASBIGCN(Model):
         #        self.gc1 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
         #        self.gc2 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
         self.gc = simpleGraphConvolutionalignment(2 * opt.hidden_dim, 2 * opt.hidden_dim, opt.edge_size, bias=True)
-        self.fc = nn.Linear(8 * opt.hidden_dim, out_class)
+        self.fc_final = nn.Linear(8 * opt.hidden_dim, out_class)
         #        self.fc1 = nn.Linear(768*2,768)
         
     
@@ -446,52 +447,59 @@ class ASBIGCN(Model):
         #        print(text_out.size())
         # graph output  outs, attss
         text, attss = self.gc(text, adj1, adj2, edge1, edge2, length2mask(text_len, max_len))
-        spanlen = max([len(item) for item in span_indices])
+        max_num_spans = max([len(item) for item in span_indices])
         
         # aspect span
-        tmp = torch.zeros(text_indices.size(0), spanlen, 4 * self.opt.hidden_dim).float().cuda()
-        tmp1 = torch.zeros(text_indices.size(0), spanlen, 2 * self.opt.hidden_dim).float().cuda()
+        h_f_maxPool = torch.zeros(text_indices.size(0), max_num_spans, 4 * self.opt.hidden_dim).float().cuda()
+        h_f_sum = torch.zeros(text_indices.size(0), max_num_spans, 2 * self.opt.hidden_dim).float().cuda()
+
         for i, spans in enumerate(span_indices):
             for j, span in enumerate(spans):
-                tmp[i, j], _ = torch.max(text[i, span[0]:span[1]], -2)
-                #                tmp[i,j]=torch.sum(text[i,span[0]:span[1]],-2)
-                #                tmp[i,j]=torch.sum(x2[i,span[0]:span[1]],-2)
-                tmp1[i, j] = torch.sum(x[i, span[0]:span[1]], -2)
-                x=tmp[:,0,:]
-                maskas=length2mask(torch.Tensor([len(item) for item in span_indices]).long().cuda(),spanlen)#b,span
-                x=torch.matmul(torch.softmax(torch.matmul(tmp[:,:,:],hout.unsqueeze(-1)).squeeze(-1)+(1-maskas)*-1e20,-1).unsqueeze(-2),tmp[:,:,:]).squeeze(-2)#b,span
+
+                # MaxPooling
+                h_f_maxPool[i, j], _ = torch.max(text[i, span[0]:span[1]], -2)
+
+                # Sum
+                h_f_sum[i, j] = torch.sum(x[i, span[0]:span[1]], -2)
+
+                maskas = length2mask(torch.tensor([len(item) for item in span_indices]).long().cuda(), max_num_spans) # b,span
+
+                a_f = torch.softmax(torch.matmul(h_f_maxPool, hout.unsqueeze(-1)).squeeze(-1) + (1-maskas)*-1e20, -1).unsqueeze(-2)
+                x = torch.matmul(a_f, h_f_maxPool).squeeze(-2) # b,span
+
                 x=self.linear1(x)
-                x1=tmp1[:,0,:]
-                x1=torch.matmul(torch.softmax(torch.matmul(tmp1[:,:,:],hout.unsqueeze(-1)).squeeze(-1)+(1-maskas)*-1e20,-1).unsqueeze(-2),tmp1[:,:,:]).squeeze(-2)
+                x1=h_f_sum[:,0,:]
+                x1=torch.matmul(torch.softmax(torch.matmul(h_f_sum[:,:,:],hout.unsqueeze(-1)).squeeze(-1)+(1-maskas)*-1e20,-1).unsqueeze(-2),h_f_sum[:,:,:]).squeeze(-2)
                 x1=self.linear2(x1)
-                _, (x, _) = self.text_lstm1(tmp, torch.Tensor([len(item) for item in span_indices]).long().cuda())#b,h
+                _, (x, _) = self.text_lstm1(h_f_maxPool, torch.Tensor([len(item) for item in span_indices]).long().cuda())#b,h
                 x = F.relu(self.gc1(self.position_weight(text_out, aspect_double_idx, text_len, aspect_len), adj))
                 x = F.relu(self.gc2(self.position_weight(x, aspect_double_idx, text_len, aspect_len), adj))
                 x = self.mask(x, aspect_double_idx)
                 x=torch.transpose(x, 0, 1)
                 x=x.reshape(x.size(0),-1)
-                masked=length2mask(text_len,max_len)
-                for i,spans in enumerate(span_indices):
-                    for j,span in enumerate(spans):
-                        masked[i,span[0]:span[1]]=0
-                masked=(1-masked)*-1e20
-                masked=masked.unsqueeze(-2)
-                alpha_mat = torch.matmul(x.unsqueeze(1), text_out.transpose(1, 2))
-                self.alpha= F.softmax(masked+alpha_mat.sum(1, keepdim=True), dim=2)
-                x = torch.matmul(self.alpha, text_out).squeeze(1) # batch_size x 2*hidden_dim
-        #        x,self.alpha =self.mul1(x,text_out,masked)
-        #        print(x.size())
-        #        x1,self.alpha1 =self.mul2(hout,text_out,length2mask(text_len,max_len))
-        #        x = torch.matmul(self.alpha, text_out).squeeze(1) # batch_size x 2*hidden_dim
-                alpha_mat = torch.matmul(x1.unsqueeze(1), text_out.transpose(1, 2))
-                self.alpha1 = F.softmax(masked+alpha_mat.sum(1, keepdim=True), dim=2)
-                x1 = torch.matmul(self.alpha1, text_out).squeeze(1) # batch_size x 2*hidden_dim
-                output = self.fc(torch.cat([tmp[:,0,:],tmp1[:,0,:]],-1))
-        
-                output=self.fc(oss)
-                output = self.fc1(torch.nn.functional.relu(self.fc(torch.cat([tmp[:,0,:],tmp1[:,0,:]],-1))))
-                output = self.fc1(torch.nn.functional.relu(self.fc(torch.cat([x],-1))))
-        logits = self.fc(torch.cat([hout, tmp[:, 0, :], tmp1[:, 0, :]], -1))
+
+        # mask out aspects' tokens
+        masked=length2mask(text_len,max_len)
+
+        for i,spans in enumerate(span_indices):
+            for j,span in enumerate(spans):
+                masked[i,span[0]:span[1]]=0
+
+
+        masked = (1-masked)*-1e20
+        masked = masked.unsqueeze(-2)
+        alpha_mat = torch.matmul(x.unsqueeze(1), text_out.transpose(1, 2))
+        self.alpha = nn.functional.softmax(masked+alpha_mat.sum(1, keepdim=True), dim=2)
+        x = torch.matmul(self.alpha, text_out).squeeze(1) # b * 2 * 768
+#        x,self.alpha =self.mul1(x,text_out,masked)
+#        x1,self.alpha1 =self.mul2(hout,text_out,length2mask(text_len,max_len))
+#        x = torch.matmul(self.alpha, text_out).squeeze(1) # batch_size x 2*hidden_dim
+        alpha_mat = torch.matmul(x1.unsqueeze(1), text_out.transpose(1, 2))
+        a_f = nn.functional.softmax(masked + alpha_mat.sum(1, keepdim=True), dim=2)
+        x1 = torch.matmul(a_f, text_out).squeeze(1) # batch_size * 2*hidden_dim
+
+        h_f_last = self.fc1(torch.nn.functional.relu(self.fc_final(torch.cat([h_f_maxPool[:, 0, :], h_f_sum[:, 0, :]], -1))))
+        logits = self.fc_final(h_f_last)
         probs = nn.functional.softmax(logits)  # (b, num_aspects, r_class)
         output = {"logits": logits, "probs": probs}
         
