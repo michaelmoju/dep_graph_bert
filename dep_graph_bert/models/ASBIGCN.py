@@ -1,15 +1,132 @@
+from typing import List
 import torch
 import torch.nn as nn
-from typing import Any, Dict, List, Optional, Tuple, DefaultDict, Set, Union
-import allennlp.nn.util as util
+from typing import Dict
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.modules.text_field_embedders import TextFieldEmbedder
-from allennlp.modules.seq2vec_encoders import Seq2VecEncoder
 from allennlp.models import Model
-from allennlp.training.metrics import CategoricalAccuracy, FBetaMeasure
-from overrides import overrides
-from transformers.modeling_bert import BertLayerNorm, BertModel
-from .dynamic_rnn import DynamicLSTM
+from transformers.modeling_bert import BertLayerNorm
+from dep_graph_bert.models.layers.dynamic_rnn import DynamicLSTM
+from .layers.gcn import GraphConvolution
+
+
+@Model.register("asbigcn")
+class ASBIGCN(Model):
+    def __init__(self,
+                 vocab: Vocabulary,
+                 text_field_embedder: TextFieldEmbedder,
+                 embedding_matrix,
+                 opt,
+                 **kwargs):
+        super().__init__(vocab, **kwargs)
+        out_class = vocab.get_vocab_size('label')
+        
+        self._text_embed_dropout = nn.Dropout(0.1)
+        self._text_field_embedder = text_field_embedder
+        self.opt = opt
+        self.text_lstm = DynamicLSTM(input_size=768, hidden_size=256, num_layers=1, batch_first=True, bidirectional=True)
+        self._dual_transformer = DualTransformer(opt.hidden_dim, opt.hidden_dim, opt.edge_size, bias=True)
+        self._W_plum = nn.Linear(2 * opt.hidden_dim, opt.hidden_dim, bias=False)
+        self._W3 = torch.nn.Linear(opt.hidden_dim, opt.hidden_dim, bias=False)
+        self._final_classifier = nn.Linear(opt.hidden_dim, out_class)
+    
+    def forward(self,
+                tokens: TextFieldTensors,
+                transformer_indices: List,
+                arg_matrix: torch.Tensor,
+                aspect_span: torch.Tensor,
+                label: torch.IntTensor = None
+                ) -> Dict[str, torch.Tensor]:
+        """
+        :param tokens:
+        :param transformer_indices: b - Ns_len - 2(start, end)
+        :param arg_matrix:
+        :param aspect_span:
+        :param label:
+        :return:
+        """
+
+        text_indices, span_indices, transformer_indices, adj1, adj2, edge1, edge2 = inputs
+        ################
+        # text_indices = b * len (token_ids)
+        # span_indices = b * num_aspects
+        # transformer_indices = b - Ns_len - 2(start, end)
+        ################
+        # embeddins
+        embedded_text = self._text_field_embedder(tokens)  # b * words * 768
+        embedded_text = embedded_text[:, 1:, :]  # remove [CLS]
+        embedded_text = self._text_embed_dropout(embedded_text)
+        batch_size = embedded_text.shape[0]
+        
+        max_Ns_len = max([len(spans) for spans in transformer_indices])
+        Ns = torch.zeros(batch_size, max_Ns_len, 768).float().cuda() # b * max_Ns * 768
+        
+        # sum aspect spans
+        for i, spans in enumerate(transformer_indices):
+            for j, span in enumerate(spans):
+                Ns[i, j] = torch.sum(embedded_text[i, span[0]:span[1]], 0)
+        Ns = self._text_embed_dropout(Ns)
+        
+        # Dual-transformer structure
+        Ns_lengths = torch.Tensor([len(item) for item in transformer_indices]).long().cuda()
+        S_tr, _ = self._dual_transformer(Ns, adj1, adj2, edge1, edge2, length2mask(Ns_lengths, max_Ns_len))  # b, Ns, hidden
+        
+        # aspect span
+        max_spans = max([len(spans) for spans in span_indices])
+        h_f = torch.zeros(batch_size, max_spans, self.opt.hidden_dim).float().cuda()  # (b, max_spans, hidden)
+        for i, spans in enumerate(span_indices):
+            for j, span in enumerate(spans):
+                # MaxPooling
+                h_f[i, j], _ = torch.max(S_tr[i, span[0]:span[1]], -2)
+    
+        h_f = h_f[:, 0, :]  # (b, hidden)
+        h_f = self._W3(h_f)  # (b, hidden)
+        
+        # mask out aspects' tokens
+        masked = length2mask(Ns_lengths, max_Ns_len)  # b * max_Ns_len
+        for i, spans in enumerate(span_indices):
+            for j, span in enumerate(spans):
+                masked[i, span[0]:span[1]] = 0
+        
+        masked = (1 - masked) * -1e20
+        masked = masked.unsqueeze(-2)  # b, 1, Ns
+        attn_weights = torch.matmul(h_f.unsqueeze(1), S_tr.transpose(1, 2))  # b, 1, Ns
+        attn_weights = nn.functional.softmax(attn_weights + masked, dim=-1)  # b, 1, Ns
+        S_tr_attn = torch.matmul(attn_weights, S_tr).squeeze(1)  # b * hidden
+        
+        # final classifier
+        h_f_last = nn.functional.relu(self._W_plum(torch.cat([h_f, S_tr_attn], -1)))  # b, hidden
+        logits = self._final_classifier(h_f_last)  # (b, r_class)
+        probs = nn.functional.softmax(logits)  # (b, r_class)
+        output = {"logits": logits, "probs": probs}
+        
+        if label is not None:
+            output["loss"] = self._loss_fn(logits, label)
+        
+        return output
+    
+    
+class BiGCN(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        self._gcn_out = GraphConvolution(hidden_size, hidden_size, bias=False)
+        self._gcn_in = GraphConvolution(hidden_size, hidden_size, bias=False)
+        self.fc_O = nn.Linear(2*hidden_size, hidden_size)
+        self._layer_norm = nn.LayerNorm(hidden_size)
+    
+    def forward(self, Q_t, adj_in, adj_out):
+        """
+        :param Q_t: b, Ns, hidden
+        :param adj_in: b, Ns, Ns
+        :param adj_out: b, Ns, Ns
+        :return: (b, Ns, hidden)
+        """
+        Q_out = self._gcn_out(Q_t, adj_out)  # b, Ns, hidden
+        Q_in = self._gcn_in(Q_t, adj_in)  # b, Ns, hidden
+        concat = torch.cat([Q_out, Q_in], dim=-1)  # b, Ns, 2*hidden
+        concat = nn.functional.relu(self.fc_O(concat))  # b, Ns, hidden
+        Q_t_next = self._layer_norm(Q_t+concat)  # b, Ns, hidden
+        return Q_t_next
 
 
 class SelfAlignment(nn.Module):
@@ -58,32 +175,32 @@ def init_weights(module):
         module.bias.data.zero_()
 
 
-class simpleGraphConvolutionalignment(nn.Module):
+class DualTransformer(nn.Module):
     """
     Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
     """
     
-    def __init__(self, in_features, out_features, edge_size, bias=False):
-        super(simpleGraphConvolutionalignment, self).__init__()
-        self.K = 3
+    def __init__(self, input_dim, output_dim, edge_size, bias=False):
+        super(DualTransformer, self).__init__()
+        self.T = 3
         #        self.bertlayer=BertLayer(config)
         #        self.bertlayer1=BertcoLayer(config)
         #        self.bertlayer.apply(init_weights)
-        self.norm = torch.nn.LayerNorm(out_features)
-        self.edge_vocab = torch.nn.Embedding(edge_size, out_features)
-        self.in_features = in_features
-        self.out_features = out_features
+        self._layer_norm = torch.nn.LayerNorm(output_dim)
+        self.edge_vocab = torch.nn.Embedding(edge_size, output_dim)
+        self._input_dim = input_dim
+        self.output_dim = output_dim
         self.dropout = nn.Dropout(0.1)
         #        self.dropout1 = nn.Dropout(0.0)
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
-        self.linear = torch.nn.Linear(out_features, out_features, bias=False)
+        self._transform_input2output_dim = nn.Parameter(torch.FloatTensor(input_dim, output_dim))
+        self._W = torch.nn.Linear(output_dim, output_dim, bias=False)
         #        self.linear2=torch.nn.Linear(4*out_features,out_features,bias=False)
-        self.align = SelfAlignment(out_features)
+        self.align = SelfAlignment(output_dim)
         #        self.align1=selfalignment(out_features)
         #        self.align1=selfalignment(out_features)
         #        self.align2=selfalignment(out_features)
         if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(out_features))
+            self.bias = nn.Parameter(torch.FloatTensor(output_dim))
         else:
             self.register_parameter('bias', None)
     
@@ -94,16 +211,17 @@ class simpleGraphConvolutionalignment(nn.Module):
     
     def forward(self, embedded_text, adj1, adj2, edge1, edge2, textmask):
         """
-        :param embedded_text: S0, contextualized embedding, b * sent_len * 768
+        :param embedded_text: (b, max_Ns, 768)
         :param adj1:
         :param adj2:
         :param edge1:
         :param edge2:
-        :param textmask:
+        :param textmask:  (b, max_Ns)
         :return:
         """
         adj = adj1 + adj2
         adj[adj >= 1] = 1
+        
         edge = self.edge_vocab(edge1 + edge2)
         #        edge=edge.view(-1,edge.size(1),edge.size(1),self.out_features,self.out_features)
         #        for i in range(adj.size(1)):
@@ -113,9 +231,11 @@ class simpleGraphConvolutionalignment(nn.Module):
         #        extended_attention_mask = textmask.unsqueeze(1).unsqueeze(2)
         #        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
         attss = [adj1, adj2]
-        if (self.in_features != self.out_features):
-            output = torch.relu(torch.matmul(embedded_text, self.weight))
-            out = torch.relu(torch.matmul(embedded_text, self.weight))
+        
+        # Transform dimension if input and output dimensions are not equal
+        if self._input_dim != self.output_dim:
+            output = torch.relu(torch.matmul(embedded_text, self._transform_input2output_dim))
+            out = torch.relu(torch.matmul(embedded_text, self._transform_input2output_dim))
             outss = out
         else:
             output = embedded_text
@@ -123,7 +243,9 @@ class simpleGraphConvolutionalignment(nn.Module):
             outss = embedded_text
         #        outs,att1=self.align(out,out, textmask)
         #        attss.append(att1)
-        for _ in range(self.K):
+        
+        # Perform convolution
+        for _ in range(self.T):
             #            outs=self.bertlayer(out,attention_mask=extended_attention_mask)[0]
             #            outs,att1=self.align(out,out, textmask)
             #            attss.append(att1)
@@ -132,7 +254,7 @@ class simpleGraphConvolutionalignment(nn.Module):
             #            teout=torch.matmul(text2.unsqueeze(-2),edge).squeeze(-2)
             #            teout=self.linear2(torch.cat([edge,text2,edge*text2,torch.abs(edge-text2)],-1))
             
-            teout = self.linear(output)
+            teout = self._W(output)
             denom1 = torch.sum(adj, dim=2, keepdim=True) + 1
             ##            atts=self.renorm(adj,att1)
             output = self.dropout(torch.relu(torch.matmul(adj, teout) / denom1))
@@ -143,7 +265,7 @@ class simpleGraphConvolutionalignment(nn.Module):
             #            output=self.dropout1(torch.relu(self.linear2(torch.cat([output1,output2],-1))))
             if self.bias is not None:
                 output = output + self.bias
-            output = self.norm(output) + outs
+            output = self._layer_norm(output) + outs
             outs = output
         #            out=outs+output
         #            output=out
@@ -157,31 +279,6 @@ class simpleGraphConvolutionalignment(nn.Module):
         outs, att1 = self.align(outs, outs, textmask)
         outs = torch.cat([outs, outs1], -1)
         return outs, attss  # b,s,h
-
-
-class GraphConvolution(nn.Module):
-    """
-    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
-    """
-    
-    def __init__(self, in_features, out_features, bias=True):
-        super(GraphConvolution, self).__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-    
-    def forward(self, text, adj):
-        hidden = torch.matmul(text, self.weight)
-        denom = torch.sum(adj, dim=2, keepdim=True) + 1
-        output = torch.matmul(adj, hidden) / denom
-        if self.bias is not None:
-            return output + self.bias
-        else:
-            return output
 
 
 class biedgeGraphConvolution(nn.Module):
@@ -260,70 +357,6 @@ class biedgeGraphConvolution(nn.Module):
         return output, outss  # b,s,h
 
 
-class ASGCN(nn.Module):
-    def __init__(self, embedding_matrix, opt):
-        super(ASGCN, self).__init__()
-        self.opt = opt
-        self.embed = nn.Embedding.from_pretrained(torch.tensor(embedding_matrix, dtype=torch.float))
-        self.text_lstm = DynamicLSTM(opt.embed_dim, opt.hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
-        self.gc1 = GraphConvolution(2 * opt.hidden_dim, 2 * opt.hidden_dim)
-        self.gc2 = GraphConvolution(2 * opt.hidden_dim, 2 * opt.hidden_dim)
-        self.fc = nn.Linear(2 * opt.hidden_dim, opt.polarities_dim)
-        self.text_embed_dropout = nn.Dropout(0.3)
-    
-    def position_weight(self, x, aspect_double_idx, text_len, aspect_len):
-        batch_size = x.shape[0]
-        seq_len = x.shape[1]
-        aspect_double_idx = aspect_double_idx.cpu().numpy()
-        text_len = text_len.cpu().numpy()
-        aspect_len = aspect_len.cpu().numpy()
-        weight = [[] for i in range(batch_size)]
-        for i in range(batch_size):
-            context_len = text_len[i] - aspect_len[i]
-            for j in range(aspect_double_idx[i, 0]):
-                weight[i].append(1 - (aspect_double_idx[i, 0] - j) / context_len)
-            for j in range(aspect_double_idx[i, 0], aspect_double_idx[i, 1] + 1):
-                weight[i].append(0)
-            for j in range(aspect_double_idx[i, 1] + 1, text_len[i]):
-                weight[i].append(1 - (j - aspect_double_idx[i, 1]) / context_len)
-            for j in range(text_len[i], seq_len):
-                weight[i].append(0)
-        weight = torch.tensor(weight).unsqueeze(2).to(self.opt.device)
-        return weight * x
-    
-    def mask(self, x, aspect_double_idx):
-        batch_size, seq_len = x.shape[0], x.shape[1]
-        aspect_double_idx = aspect_double_idx.cpu().numpy()
-        mask = [[] for i in range(batch_size)]
-        for i in range(batch_size):
-            for j in range(aspect_double_idx[i, 0]):
-                mask[i].append(0)
-            for j in range(aspect_double_idx[i, 0], aspect_double_idx[i, 1] + 1):
-                mask[i].append(1)
-            for j in range(aspect_double_idx[i, 1] + 1, seq_len):
-                mask[i].append(0)
-        mask = torch.tensor(mask).unsqueeze(2).float().to(self.opt.device)
-        return mask * x
-    
-    def forward(self, inputs):
-        text_indices, aspect_indices, left_indices, adj = inputs
-        text_len = torch.sum(text_indices != 0, dim=-1)
-        aspect_len = torch.sum(aspect_indices != 0, dim=-1)
-        left_len = torch.sum(left_indices != 0, dim=-1)
-        aspect_double_idx = torch.cat([left_len.unsqueeze(1), (left_len + aspect_len - 1).unsqueeze(1)], dim=1)
-        text = self.embed(text_indices)
-        text = self.text_embed_dropout(text)
-        text_out, (_, _) = self.text_lstm(text, text_len)
-        x = F.relu(self.gc1(self.position_weight(text_out, aspect_double_idx, text_len, aspect_len), adj))
-        x = F.relu(self.gc2(self.position_weight(x, aspect_double_idx, text_len, aspect_len), adj))
-        x = self.mask(x, aspect_double_idx)
-        alpha_mat = torch.matmul(x, text_out.transpose(1, 2))
-        alpha = F.softmax(alpha_mat.sum(1, keepdim=True), dim=2)
-        x = torch.matmul(alpha, text_out).squeeze(1)  # batch_size x 2*hidden_dim
-        output = self.fc(x)
-        return output
-
-
 class mutualatts(nn.Module):
     def __init__(self, hidden_size):
         super(mutualatts, self).__init__()
@@ -339,6 +372,26 @@ class mutualatts(nn.Module):
         context = torch.matmul(att, text).squeeze(1)
         return context, att
 
+
+class BiAffine(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.W1 = nn.Linear(hidden, hidden, bias=False)
+        self.W2 = nn.Linear(hidden, hidden, bias=False)
+
+    def forward(self, S1, S2):
+        """
+        :param S1: S_tr (b, Ns, hidden)
+        :param S2: S_g (b, Ns, hidden)
+        :return:
+        """
+        S2 = self.W1(S2)  # (b, Ns, hidden)
+        attn1 = torch.softmax(torch.matmul(S1, S2.transpose(1, 2)), dim=-1)
+        
+        
+        
+        return
+    
 
 class mutualatt(nn.Module):
     """
@@ -363,7 +416,7 @@ class mutualatt(nn.Module):
 def length2mask(lengths, max_length):
     """
     :param lengths: b
-    :param max_length:
+    :param max_length
     :return: b * max_length
     """
     lengths = lengths.unsqueeze(-1).repeat([1] * lengths.dim() + [max_length]).long()
@@ -373,139 +426,6 @@ def length2mask(lengths, max_length):
     return mask.float().cuda()
 
 
-@Model.register("asbigcn")
-class ASBIGCN(Model):
-    def __init__(self,
-                 vocab: Vocabulary,
-                 text_field_embedder: TextFieldEmbedder,
-                 embedding_matrix,
-                 opt,
-                 **kwargs):
-        super().__init__(vocab, **kwargs)
-        out_class = vocab.get_vocab_size('label')
 
-        self._text_embed_dropout = nn.Dropout(0.1)
-        self._text_field_embedder = text_field_embedder
-        self.opt = opt
-        #        self.mul1=mutualatt(2*opt.hidden_dim)
-        #        self.mul2=mutualatt(2*opt.hidden_dim)
-        self.embed = nn.Embedding.from_pretrained(torch.tensor(embedding_matrix, dtype=torch.float))
-        self.text_lstm = DynamicLSTM(768, opt.hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
-        #        self.text_lstm1 = DynamicLSTM(2*opt.hidden_dim, opt.hidden_dim, num_layers=1, batch_first=True, bidirectional=True)
-        #        self.text_lstm2 = DynamicLSTM(opt.embed_dim, 384, num_layers=1, batch_first=True, bidirectional=True)
-        #        self.gc1 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
-        #        self.gc2 = GraphConvolution(2*opt.hidden_dim, 2*opt.hidden_dim)
-        self.gc = simpleGraphConvolutionalignment(2 * opt.hidden_dim, 2 * opt.hidden_dim, opt.edge_size, bias=True)
-        self.fc_final = nn.Linear(8 * opt.hidden_dim, out_class)
-        #        self.fc1 = nn.Linear(768*2,768)
-        
-    
-    #        self.linear1=torch.nn.Linear(2*opt.hidden_dim, 2*opt.hidden_dim,bias=False)
-    #        self.linear2=torch.nn.Linear(2*opt.hidden_dim, 2*opt.hidden_dim,bias=False)
-    #        self.linear3=torch.nn.Linear(768, 2*opt.hidden_dim,bias=True)
-    
-    def forward(self,
-                tokens: TextFieldTensors,
-                arg_matrix: torch.Tensor,
-                aspect_span: torch.Tensor,
-                label: torch.IntTensor = None
-                ) -> Dict[str, torch.Tensor]:
-
-        inputs, mixed=True
-        
-        # embeddins
-        embedded_text = self._text_field_embedder(tokens)  # b * words * 768
-        embedded_text = embedded_text[:, 1:, :]  # remove [CLS]
-        oss = self._text_embed_dropout(embedded_text)
-        
-        ####
-        #### span_indices = b * num_aspects
-        ####
-        
-        text_indices, span_indices, transformer_indices, adj1, adj2, edge1, edge2 = inputs
-        
-        batchhalf = text_indices.size(0) // 2
-        text_len = torch.sum(text_indices != 0, dim=-1)
-
-        max_len = max([len(item) for item in transformer_indices])
-        text_len = torch.Tensor([len(item) for item in transformer_indices]).long().cuda()
-        tmps = torch.zeros(text_indices.size(0), max_len, 768).float().cuda()
-        for i, spans in enumerate(transformer_indices):
-            for j, span in enumerate(spans):
-                tmps[i, j] = torch.sum(output[i, span[0]:span[1]], 0)
-        #        aspect_len = torch.sum(aspect_indices != 0, dim=-1)
-        #        left_len = torch.sum(left_indices != 0, dim=-1)
-        #        aspect_double_idx = torch.cat([left_len.unsqueeze(1), (left_len+aspect_len-1).unsqueeze(1)], dim=1)
-        #        text = self.embed(text_indices)
-        text = self._text_embed_dropout(tmps)
-        
-        text, (hout, _) = self.text_lstm(text, text_len)
-        x = text
-        #        text_out=torch.relu(self.linear3(text))
-        hout = torch.transpose(hout, 0, 1)
-        hout = hout.reshape(hout.size(0), -1)
-        #        print(text_out.size())
-        # graph output  outs, attss
-        text, attss = self.gc(text, adj1, adj2, edge1, edge2, length2mask(text_len, max_len))
-        max_num_spans = max([len(item) for item in span_indices])
-        
-        # aspect span
-        h_f_maxPool = torch.zeros(text_indices.size(0), max_num_spans, 4 * self.opt.hidden_dim).float().cuda()
-        h_f_sum = torch.zeros(text_indices.size(0), max_num_spans, 2 * self.opt.hidden_dim).float().cuda()
-
-        for i, spans in enumerate(span_indices):
-            for j, span in enumerate(spans):
-
-                # MaxPooling
-                h_f_maxPool[i, j], _ = torch.max(text[i, span[0]:span[1]], -2)
-
-                # Sum
-                h_f_sum[i, j] = torch.sum(x[i, span[0]:span[1]], -2)
-
-                maskas = length2mask(torch.tensor([len(item) for item in span_indices]).long().cuda(), max_num_spans) # b,span
-
-                a_f = torch.softmax(torch.matmul(h_f_maxPool, hout.unsqueeze(-1)).squeeze(-1) + (1-maskas)*-1e20, -1).unsqueeze(-2)
-                x = torch.matmul(a_f, h_f_maxPool).squeeze(-2) # b,span
-
-                x=self.linear1(x)
-                x1=h_f_sum[:,0,:]
-                x1=torch.matmul(torch.softmax(torch.matmul(h_f_sum[:,:,:],hout.unsqueeze(-1)).squeeze(-1)+(1-maskas)*-1e20,-1).unsqueeze(-2),h_f_sum[:,:,:]).squeeze(-2)
-                x1=self.linear2(x1)
-                _, (x, _) = self.text_lstm1(h_f_maxPool, torch.Tensor([len(item) for item in span_indices]).long().cuda())#b,h
-                x = F.relu(self.gc1(self.position_weight(text_out, aspect_double_idx, text_len, aspect_len), adj))
-                x = F.relu(self.gc2(self.position_weight(x, aspect_double_idx, text_len, aspect_len), adj))
-                x = self.mask(x, aspect_double_idx)
-                x=torch.transpose(x, 0, 1)
-                x=x.reshape(x.size(0),-1)
-
-        # mask out aspects' tokens
-        masked=length2mask(text_len,max_len)
-
-        for i,spans in enumerate(span_indices):
-            for j,span in enumerate(spans):
-                masked[i,span[0]:span[1]]=0
-
-
-        masked = (1-masked)*-1e20
-        masked = masked.unsqueeze(-2)
-        alpha_mat = torch.matmul(x.unsqueeze(1), text_out.transpose(1, 2))
-        self.alpha = nn.functional.softmax(masked+alpha_mat.sum(1, keepdim=True), dim=2)
-        x = torch.matmul(self.alpha, text_out).squeeze(1) # b * 2 * 768
-#        x,self.alpha =self.mul1(x,text_out,masked)
-#        x1,self.alpha1 =self.mul2(hout,text_out,length2mask(text_len,max_len))
-#        x = torch.matmul(self.alpha, text_out).squeeze(1) # batch_size x 2*hidden_dim
-        alpha_mat = torch.matmul(x1.unsqueeze(1), text_out.transpose(1, 2))
-        a_f = nn.functional.softmax(masked + alpha_mat.sum(1, keepdim=True), dim=2)
-        x1 = torch.matmul(a_f, text_out).squeeze(1) # batch_size * 2*hidden_dim
-
-        h_f_last = self.fc1(torch.nn.functional.relu(self.fc_final(torch.cat([h_f_maxPool[:, 0, :], h_f_sum[:, 0, :]], -1))))
-        logits = self.fc_final(h_f_last)
-        probs = nn.functional.softmax(logits)  # (b, num_aspects, r_class)
-        output = {"logits": logits, "probs": probs}
-        
-        if label is not None:
-            output["loss"] = self._loss_fn(logits, label)
-        
-        return output
 
 

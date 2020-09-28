@@ -9,7 +9,6 @@ from allennlp.data.dataset_readers import DatasetReader
 from allennlp.data.token_indexers import TokenIndexer
 import spacy
 import numpy as np
-from transformers.tokenization_bert_japanese import Be
 
 nlp = spacy.load('en_core_web_sm')
 
