@@ -199,6 +199,7 @@ class DualTransformer(nn.Module):
         #        self.align1=selfalignment(out_features)
         #        self.align1=selfalignment(out_features)
         #        self.align2=selfalignment(out_features)
+        self._bi_gcn = BiGCN(hidden_size=hidden_dim)
         if bias:
             self.bias = nn.Parameter(torch.FloatTensor(output_dim))
         else:
@@ -209,28 +210,19 @@ class DualTransformer(nn.Module):
         adj = adj / (adj.sum(-1).unsqueeze(-1) + 1e-10)
         return adj
     
-    def forward(self, embedded_text, adj1, adj2, edge1, edge2, textmask):
+    def forward(self, embedded_text, adj_in, adj_out, textmask):
         """
         :param embedded_text: (b, max_Ns, 768)
-        :param adj1:
-        :param adj2:
+        :param adj_in:
+        :param adj_out:
         :param edge1:
         :param edge2:
         :param textmask:  (b, max_Ns)
         :return:
         """
-        adj = adj1 + adj2
+        adj = adj_in + adj_out
         adj[adj >= 1] = 1
-        
-        edge = self.edge_vocab(edge1 + edge2)
-        #        edge=edge.view(-1,edge.size(1),edge.size(1),self.out_features,self.out_features)
-        #        for i in range(adj.size(1)):
-        #            adj[:,i,i]=0
-        #        adj=adj2
-        textlen = embedded_text.size(1)  # s
-        #        extended_attention_mask = textmask.unsqueeze(1).unsqueeze(2)
-        #        extended_attention_mask = (1.0 - extended_attention_mask) * -10000.0
-        attss = [adj1, adj2]
+        attss = [adj_in, adj_out]
         
         # Transform dimension if input and output dimensions are not equal
         if self._input_dim != self.output_dim:
@@ -357,22 +349,6 @@ class biedgeGraphConvolution(nn.Module):
         return output, outss  # b,s,h
 
 
-class mutualatts(nn.Module):
-    def __init__(self, hidden_size):
-        super(mutualatts, self).__init__()
-        self.linear2 = torch.nn.Linear(3 * hidden_size, hidden_size)
-        self.linear1 = torch.nn.Linear(hidden_size, 1)
-    
-    def forward(self, in1, in2, text, textmask):
-        length = text.size(1)
-        in1 = in1.unsqueeze(1).repeat(1, length, 1)
-        in2 = in2.unsqueeze(1).repeat(1, length, 1)
-        att = self.linear1(torch.tanh(self.linear2(torch.cat([in1, in2, text], -1)))).squeeze(-1)
-        att = torch.softmax(((1 - textmask) * -1e20 + att), -1).unsqueeze(1)
-        context = torch.matmul(att, text).squeeze(1)
-        return context, att
-
-
 class BiAffine(nn.Module):
     def __init__(self, hidden):
         super().__init__()
@@ -381,36 +357,19 @@ class BiAffine(nn.Module):
 
     def forward(self, S1, S2):
         """
-        :param S1: S_tr (b, Ns, hidden)
-        :param S2: S_g (b, Ns, hidden)
+        :param S1: S_tr (b, N1, hidden)
+        :param S2: S_g (b, N2, hidden)
         :return:
         """
-        S2 = self.W1(S2)  # (b, Ns, hidden)
-        attn1 = torch.softmax(torch.matmul(S1, S2.transpose(1, 2)), dim=-1)
+        S2_h = self.W1(S2)  # (b, N2, hidden)
+        attn1 = torch.softmax(torch.matmul(S1, S2_h.transpose(1, 2)), dim=-1)  # (b, N1, N2)
+        S1_out = torch.matmul(attn1, S2)  # (b, N1, hidden)
         
+        S1_h = self.W2(S1)  # (b, N1, hidden)
+        attn2 = torch.softmax(torch.matmul(S2, S1_h.transpose(1, 2)), dim=-1)  # (b, N2, N1)
+        S2_out = torch.matmul(attn2, S1)  # (b, N2, hidden)
         
-        
-        return
-    
-
-class mutualatt(nn.Module):
-    """
-    Aspect-based Attention Module
-    """
-    def __init__(self, hidden_size):
-        super(mutualatt, self).__init__()
-        self.linear2 = torch.nn.Linear(2 * hidden_size, hidden_size)
-        self.linear1 = torch.nn.Linear(hidden_size, 1)
-    
-    def forward(self, in1, text, mask):
-        length = text.size(1)
-        in1 = in1.unsqueeze(1).repeat(1, length, 1)
-        att = self.linear1(torch.tanh(self.linear2(torch.cat([in1, text], -1)))).squeeze(-1)
-        att = torch.softmax(att, -1) * mask
-        att = (att / (att.sum(-1, keepdim=True) + 1e-20)).unsqueeze(-2)
-        #        att=torch.softmax(((1-textmask)*-1e20+att),-1).unsqueeze(1)
-        context = torch.matmul(att, text).squeeze(1)
-        return context, att
+        return S1_out, S2_out
 
 
 def length2mask(lengths, max_length):
