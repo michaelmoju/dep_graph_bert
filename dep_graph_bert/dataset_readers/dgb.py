@@ -7,28 +7,10 @@ from allennlp.data.instance import Instance
 from allennlp.data.fields import TextField, LabelField, ArrayField, SpanField
 from allennlp.data.dataset_readers import DatasetReader
 from allennlp.data.token_indexers import TokenIndexer
-import spacy
-import numpy as np
-
-nlp = spacy.load('en_core_web_sm')
+from .dependency_graphbiedge import text_to_example, Example
+from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
-
-
-def parse_text(text_left, aspect, text_right):
-    
-    text = text_left + ' ' + aspect + ' ' + text_right
-    start = len(nlp(text_left))
-    end = start + len(nlp(aspect)) - 1
-    doc = nlp(text)
-    seq_len = len(doc)
-    adj_matrix = np.zeros((seq_len, seq_len)).astype('float32')
-    for token in doc:
-        adj_matrix[token.i][token.i] = 1
-        for child in token.children:
-            adj_matrix[token.i][child.i] = 1
-            adj_matrix[child.i][token.i] = 1
-    return doc, adj_matrix, start, end
 
 
 @DatasetReader.register("dgb")
@@ -40,15 +22,16 @@ class DgbReader(DatasetReader):
         self._token_indexers = token_indexers
         
     def text_to_instance(self, sentence: str, target: str, polarity_label: str = None) -> Instance:
-        text_left, _, text_right = [s.lower() for s in sentence.partition("$T$")]
-        doc, adj_matrix, start, end = parse_text(text_left, target, text_right)
-        text_field = TextField([Token(token.text) for token in doc], self._token_indexers)
-        adj_field = ArrayField(adj_matrix)
-        aspect_span_field = SpanField(start, end, text_field)
-        fields = {"tokens": text_field, "adj_matrix": adj_field, "aspect_span": aspect_span_field}
-        fields["meta"] = {"comment_text": sentence, "aspect": target}
+        example: Example = text_to_example(sentence, target, polarity_label)
+        text_field = TextField([Token(token.text) for token in example.spacy_document], self._token_indexers)
+        adj_in_field = ArrayField(example.adj_in)
+        adj_out_field = ArrayField(example.adj_out)
+        transformer_indices = ArrayField(example.transformer_indices)
+        span_indices = ArrayField(example.span_indices)
         
-        if polarity_label:
+        fields = {"tokens": text_field, "adj_in": adj_in_field, "adj_out": adj_out_field,
+                  "transformer_indices": transformer_indices, "span_indices": span_indices}
+        if example.polarity_label:
             label_field = LabelField(polarity_label, label_namespace="labels")
             fields["label"] = label_field
         return Instance(fields)
@@ -61,7 +44,7 @@ class DgbReader(DatasetReader):
         with open(file_path, "r") as f:
             lines = f.readlines()
         
-        for i in range(0, len(lines), 3):
+        for i in tqdm(range(0, len(lines), 3)):
             comment_text = lines[i].strip()
             aspect = lines[i+1].strip()
             label = lines[i+2].strip()

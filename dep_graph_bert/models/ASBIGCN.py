@@ -1,4 +1,3 @@
-from typing import List
 import torch
 import torch.nn as nn
 from typing import Dict
@@ -6,9 +5,10 @@ from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.modules.text_field_embedders import TextFieldEmbedder
 from allennlp.models import Model
 from transformers.modeling_bert import BertLayerNorm
-from dep_graph_bert.models.layers.dynamic_rnn import DynamicLSTM
+from allennlp.training.metrics import CategoricalAccuracy, FBetaMeasure
 from .layers.gcn import GraphConvolution
 import copy
+from overrides import overrides
 
 
 @Model.register("asbigcn")
@@ -16,44 +16,29 @@ class ASBIGCN(Model):
     def __init__(self,
                  vocab: Vocabulary,
                  text_field_embedder: TextFieldEmbedder,
-                 embedding_matrix,
-                 opt,
+                 hidden_dim,
                  **kwargs):
         super().__init__(vocab, **kwargs)
         out_class = vocab.get_vocab_size('label')
-        
+        T = 3
         self._text_embed_dropout = nn.Dropout(0.3)
         self._text_field_embedder = text_field_embedder
-        self.opt = opt
-        T = 3
-        self._dual_transformer = nn.ModuleList([copy.deepcopy(DualTransformer(opt.hidden_dim)) for _ in range(T)])
-        self._W_plum = nn.Linear(2 * opt.hidden_dim, opt.hidden_dim, bias=False)
-        self._W3 = torch.nn.Linear(opt.hidden_dim, opt.hidden_dim, bias=False)
-        self._final_classifier = nn.Linear(opt.hidden_dim, out_class)
+        self._dual_transformer = nn.ModuleList([copy.deepcopy(DualTransformer(hidden_dim)) for _ in range(T)])
+        self._W_plum = nn.Linear(2 * hidden_dim, hidden_dim, bias=False)
+        self._W3 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self._final_classifier = nn.Linear(hidden_dim, out_class)
+        self._positive_class_f1 = FBetaMeasure(average='macro')
+        self._accuracy = CategoricalAccuracy()
     
     def forward(self,
                 tokens: TextFieldTensors,
-                transformer_indices: List,
                 adj_in: torch.Tensor,
                 adj_out: torch.Tensor,
+                transformer_indices: torch.Tensor,
                 aspect_span: torch.Tensor,
                 label: torch.IntTensor = None
                 ) -> Dict[str, torch.Tensor]:
-        """
-        :param tokens:
-        :param transformer_indices: b - Ns_len - 2(start, end)
-        :param arg_matrix:
-        :param aspect_span:
-        :param label:
-        :return:
-        """
-
         text_indices, span_indices, transformer_indices, adj1, adj2, edge1, edge2 = inputs
-        ################
-        # text_indices = b * len (token_ids)
-        # span_indices = b * num_aspects
-        # transformer_indices = b - Ns_len - 2(start, end)
-        ################
         # embeddins
         embedded_text = self._text_field_embedder(tokens)  # b * words * 768
         embedded_text = self._text_embed_dropout(embedded_text)
@@ -106,6 +91,18 @@ class ASBIGCN(Model):
             output["loss"] = self._loss_fn(logits, label)
         
         return output
+
+    @overrides
+    def make_output_human_readable(
+            self, output_dict: Dict[str, torch.Tensor]
+    ) -> Dict[str, torch.Tensor]:
+        return output_dict
+
+    def get_metrics(self, reset: bool = False) -> Dict[str, float]:
+        return {
+            "accuracy": self._accuracy.get_metric(reset),
+            "f1": self._positive_class_f1.get_metric(reset)
+        }
     
     
 class BiGCN(nn.Module):
@@ -201,9 +198,6 @@ class DualTransformer(nn.Module):
         :param mask:  (b, max_Ns)
         :return:
         """
-        # adj = adj_in + adj_out
-        # adj[adj >= 1] = 1
-        
         S_tr1 = self._transformer(src=S_tr, src_mask=mask)
         S_g1 = self._bi_gcn(S_g, adj_out, adj_in)
         S_tr2, S_q2 = self._bi_affine(S_tr1, S_g1)
