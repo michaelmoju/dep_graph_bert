@@ -56,7 +56,6 @@ class ASBIGCN(Model):
         ################
         # embeddins
         embedded_text = self._text_field_embedder(tokens)  # b * words * 768
-        embedded_text = embedded_text[:, 1:, :]  # remove [CLS]
         embedded_text = self._text_embed_dropout(embedded_text)
         batch_size = embedded_text.shape[0]
         
@@ -211,82 +210,6 @@ class DualTransformer(nn.Module):
         S_tr_out = self._layer_norm_f(S_tr1 + S_tr2)
         S_g_out = self._layer_norm_g(S_g1 + S_q2)
         return S_tr_out, S_g_out
-
-
-class biedgeGraphConvolution(nn.Module):
-    """
-    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
-    """
-    
-    def __init__(self, in_features, out_features, edge_size, bias=True):
-        super(biedgeGraphConvolution, self).__init__()
-        self.K = 3
-        self.norm = torch.nn.LayerNorm(out_features)
-        self.edge_vocab = torch.nn.Embedding(edge_size, out_features)
-        self.in_features = in_features
-        self.out_features = out_features
-        self.dropout = nn.Dropout(0.3)
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, out_features))
-        self.fuse1 = nn.Sequential(torch.nn.Linear(2 * out_features, out_features, bias=False), torch.nn.ReLU())
-        self.fuse2 = nn.Sequential(torch.nn.Linear(2 * out_features, out_features, bias=False), torch.nn.ReLU())
-        self.fc3 = nn.Sequential(torch.nn.Linear(2 * out_features, out_features, bias=False), torch.nn.ReLU())
-        self.fc1 = nn.Sequential(torch.nn.Linear(3 * out_features, out_features, bias=False), torch.nn.ReLU(),
-                                 torch.nn.Linear(out_features, 1, bias=True))
-        self.fc2 = nn.Sequential(torch.nn.Linear(3 * out_features, out_features, bias=False), torch.nn.ReLU(),
-                                 torch.nn.Linear(out_features, 1, bias=True))
-        self.fc1s = nn.Sequential(torch.nn.Linear(3 * out_features, out_features, bias=False), torch.nn.ReLU(),
-                                  torch.nn.Linear(out_features, 1, bias=True))
-        self.fc2s = nn.Sequential(torch.nn.Linear(3 * out_features, out_features, bias=False), torch.nn.ReLU(),
-                                  torch.nn.Linear(out_features, 1, bias=True))
-        self.align = SelfAlignment(out_features)
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(out_features))
-        else:
-            self.register_parameter('bias', None)
-    
-    def renorm(self, adj1, adj2, a=0.5):
-        adj = adj1 + a * adj2
-        adj = adj / (adj.sum(-1).unsqueeze(-1) + 1e-20)
-        return adj
-    
-    def forward(self, text, adj1, adj2, edge1, edge2, textmask):
-        #        print(edge1.size())
-        #        edge1=self.edge_vocab(edge1)#b,s,s,h
-        #        edge2=self.edge_vocab(edge2)#b,s,s,h
-        textlen = text.size(1)  # s
-        outss, att1 = self.align(text, text, textmask)
-        output = torch.relu(torch.matmul(text, self.weight))
-        #        adj1s=copy.deepcopy(adj1)
-        #        adj2s=copy.deepcopy(adj2)
-        #        for i in range(adj1s.size(1)):
-        #            adj1s[:,i,i]=0
-        #            adj2s[:,i,i]=0
-        for i in range(self.K):
-            text1 = output.unsqueeze(-2).repeat(1, 1, textlen, 1)
-            text2 = output.unsqueeze(-3).repeat(1, textlen, 1, 1)
-            teout = self.fuse1(torch.cat([text2, edge1], -1))  # b,s,s,h
-            tein = self.fuse2(torch.cat([text2, edge2], -1))  # b,s,s,h
-            teouts = torch.sigmoid(self.fc1(torch.cat([text1, text2, edge1], -1)))  # b,s,s,1
-            teins = torch.sigmoid(self.fc2(torch.cat([text1, text2, edge2], -1)))  # b,s,s,1
-            #            teoutss=torch.softmax((1-adj1s)*-1e20+self.fc1s(torch.cat([text1,text2,edge1],-1)).squeeze(-1),-1)#b,s,s,1
-            #            teinss=torch.softmax((1-adj2s)*-1e20+self.fc2s(torch.cat([text1,text2,edge2],-1)).squeeze(-1),-1)#b,s,s,1
-            #            for i in range(adj1s.size(1)):
-            #                teoutss.data[:,i,i]=1.0
-            #                teinss.data[:,i,i]=1.0
-            #            hidden1 = torch.matmul(text, self.weight)
-            denom1 = torch.sum(adj1, dim=2, keepdim=True) + 1
-            #            adj1s=self.renorm(att1,adj1)
-            #            output1 = torch.sum(adj1.unsqueeze(-1)*teout*teouts*teoutss.unsqueeze(-1),-2) / denom1
-            output1 = torch.sum(adj1.unsqueeze(-1) * teout * teouts, -2) / denom1
-            denom2 = torch.sum(adj2, dim=2, keepdim=True) + 1
-            #            adj2s=self.renorm(att1,adj2)
-            #            output2 = torch.sum(adj2.unsqueeze(-1)*tein*teins*teinss.unsqueeze(-1),-2) / denom2
-            output2 = torch.sum(adj2.unsqueeze(-1) * tein * teins, -2) / denom2
-            output = self.fc3(torch.cat([output1, output2], -1)) + output
-            if self.bias is not None:
-                output = output + self.bias
-            output = self.dropout(self.norm(output))
-        return output, outss  # b,s,h
 
 
 class BiAffine(nn.Module):

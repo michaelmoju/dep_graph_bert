@@ -5,11 +5,7 @@ import tqdm
 nlp = spacy.load('en_core_web_sm')
 import re
 
-"""
-- sentence (the target is replaced with $T$)
-- target
-- polarity label (0: neutral, 1:positive, -1:negative)
-"""
+
 class Example:
     def __init__(self, sentence, target, spacy_document, adj_in, adj_out, span_indices, polarity_label=None):
         self.sentence = sentence
@@ -19,12 +15,14 @@ class Example:
         self.adj_out = adj_out
         self.span_indices = span_indices
         self.polarity_label = polarity_label
-        
+
+
 def tokenize(text):
     text=text.strip()
     text=re.sub(r' {2,}',' ',text)
     document = nlp(text)
     return [token.text for token in document]
+
 
 def update_edge(text,vocab):
     # https://spacy.io/docs/usage/processing-text
@@ -35,11 +33,12 @@ def update_edge(text,vocab):
                vocab[token.dep_]=len(vocab)
     return 0
 
+
 def span(texts,aspect):
     startid=0
     aslen=len(tokenize(aspect))
     spans=[]
-    for idx,text in enumerate(texts):
+    for idx, text in enumerate(texts):
         tmp=len(tokenize(text))
         startid+=tmp
         tmp=startid
@@ -100,11 +99,17 @@ def concat(texts,aspect):
     return re.sub(r' {2,}',' ',source.strip())
 
 
-def process(filename, edge_vocab=None):
-    if edge_vocab is not None:
-        pass
-    else:
-        edge_vocab={'<pad>':0,'<unk>':1}
+def text_to_example(sentence: str, target: str, polarity_label: str = None):
+    edge_vocab = {'<pad>': 0, '<unk>': 1}
+
+    text_left = [s.lower().strip() for s in sentence.split("$T$")]
+    aspect = target.lower().strip()
+    span_indices = span(text_left, aspect)
+    adj_in, adj_out, edge, edge1, document = dependency_adj_matrix(concat(text_left, aspect), edge_vocab)
+    return Example(sentence, target, document, adj_in, adj_out, span_indices, polarity_label)
+
+
+def process_file(filename):
     fin = open(filename, 'r', encoding='utf-8', newline='\n', errors='ignore')
     lines = fin.readlines()
     fin.close()
@@ -115,10 +120,6 @@ def process(filename, edge_vocab=None):
         target = lines[i + 1]
         polarity_label = lines[i + 2]
         
-        text_left = [s.lower().strip() for s in sentence.split("$T$")]
-        aspect = target.lower().strip()
-        span_indices = span(text_left, aspect)
-        adj_in, adj_out, edge, edge1, document = dependency_adj_matrix(concat(text_left,aspect),edge_vocab)
-        
-        out_examples.append(Example(sentence, target, document, adj_in, adj_out, span_indices, polarity_label))
+        example = text_to_example(sentence, target, polarity_label)
+        out_examples.append(example)
     return out_examples

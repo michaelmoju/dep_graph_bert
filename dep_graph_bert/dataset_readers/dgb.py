@@ -39,17 +39,17 @@ class DgbReader(DatasetReader):
         super().__init__(**kwargs)
         self._token_indexers = token_indexers
         
-    def text_to_instance(self, comment_text: str, aspect: str, label: str = None) -> Instance:
-        text_left, _, text_right = [s.lower() for s in comment_text.partition("$T$")]
-        doc, adj_matrix, start, end = parse_text(text_left, aspect, text_right)
+    def text_to_instance(self, sentence: str, target: str, polarity_label: str = None) -> Instance:
+        text_left, _, text_right = [s.lower() for s in sentence.partition("$T$")]
+        doc, adj_matrix, start, end = parse_text(text_left, target, text_right)
         text_field = TextField([Token(token.text) for token in doc], self._token_indexers)
         adj_field = ArrayField(adj_matrix)
         aspect_span_field = SpanField(start, end, text_field)
         fields = {"tokens": text_field, "adj_matrix": adj_field, "aspect_span": aspect_span_field}
-        fields["meta"] = {"comment_text": comment_text, "aspect": aspect}
+        fields["meta"] = {"comment_text": sentence, "aspect": target}
         
-        if label:
-            label_field = LabelField(label, label_namespace="labels")
+        if polarity_label:
+            label_field = LabelField(polarity_label, label_namespace="labels")
             fields["label"] = label_field
         return Instance(fields)
     
