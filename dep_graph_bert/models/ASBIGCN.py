@@ -35,10 +35,9 @@ class ASBIGCN(Model):
                 adj_in: torch.Tensor,
                 adj_out: torch.Tensor,
                 transformer_indices: torch.Tensor,
-                aspect_span: torch.Tensor,
+                span_indices: torch.Tensor,
                 label: torch.IntTensor = None
                 ) -> Dict[str, torch.Tensor]:
-        text_indices, span_indices, transformer_indices, adj1, adj2, edge1, edge2 = inputs
         # embeddins
         embedded_text = self._text_field_embedder(tokens)  # b * words * 768
         embedded_text = self._text_embed_dropout(embedded_text)
@@ -126,52 +125,6 @@ class BiGCN(nn.Module):
         concat = nn.functional.relu(self.fc_O(concat))  # b, Ns, hidden
         Q_t_next = self._layer_norm(Q_t+concat)  # b, Ns, hidden
         return Q_t_next
-
-
-class SelfAlignment(nn.Module):
-    """
-    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
-    """
-    
-    def __init__(self, in_features, bias=True):
-        super(SelfAlignment, self).__init__()
-        self.in_features = in_features
-        self.dropout = nn.Dropout(0.1)
-        #        self.out_features = out_features
-        self.weight = nn.Parameter(torch.FloatTensor(in_features, in_features))
-        self.linear = torch.nn.Linear(in_features, in_features, bias=False)
-        self.linear1 = torch.nn.Linear(in_features, in_features)
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(in_features))
-        else:
-            self.register_parameter('bias', None)
-    
-    def forward(self, text, text1, textmask):
-        logits = torch.matmul(self.linear(text), text1.transpose(1, 2))
-        masked = textmask.unsqueeze(1)
-        masked = (1 - masked) * -1e20
-        logits = torch.softmax(logits + masked, -1)
-        output = torch.matmul(logits, text1)
-        #        output = self.dropout(torch.relu(self.linear1(torch.matmul(logits,text1))))+text
-        output = output * textmask.unsqueeze(-1)
-        if self.bias is not None:
-            return output + self.bias, logits * textmask.unsqueeze(-1)
-        else:
-            return output, logits * textmask.unsqueeze(-1)
-
-
-def init_weights(module):
-    """ Initialize the weights.
-    """
-    if isinstance(module, (nn.Linear, nn.Embedding)):
-        # Slightly different from the TF version which uses truncated_normal for initialization
-        # cf https://github.com/pytorch/pytorch/pull/5617
-        module.weight.data.normal_(mean=0.0, std=0.01)
-    elif isinstance(module, BertLayerNorm):
-        module.bias.data.zero_()
-        module.weight.data.fill_(1.0)
-    if isinstance(module, nn.Linear) and module.bias is not None:
-        module.bias.data.zero_()
 
 
 class DualTransformer(nn.Module):
