@@ -8,6 +8,7 @@ from allennlp.models import Model
 from transformers.modeling_bert import BertLayerNorm
 from dep_graph_bert.models.layers.dynamic_rnn import DynamicLSTM
 from .layers.gcn import GraphConvolution
+import copy
 
 
 @Model.register("asbigcn")
@@ -21,11 +22,11 @@ class ASBIGCN(Model):
         super().__init__(vocab, **kwargs)
         out_class = vocab.get_vocab_size('label')
         
-        self._text_embed_dropout = nn.Dropout(0.1)
+        self._text_embed_dropout = nn.Dropout(0.3)
         self._text_field_embedder = text_field_embedder
         self.opt = opt
-        self.text_lstm = DynamicLSTM(input_size=768, hidden_size=256, num_layers=1, batch_first=True, bidirectional=True)
-        self._dual_transformer = DualTransformer(opt.hidden_dim, opt.hidden_dim, opt.edge_size, bias=True)
+        T = 3
+        self._dual_transformer = nn.ModuleList([copy.deepcopy(DualTransformer(opt.hidden_dim)) for _ in range(T)])
         self._W_plum = nn.Linear(2 * opt.hidden_dim, opt.hidden_dim, bias=False)
         self._W3 = torch.nn.Linear(opt.hidden_dim, opt.hidden_dim, bias=False)
         self._final_classifier = nn.Linear(opt.hidden_dim, out_class)
@@ -33,7 +34,8 @@ class ASBIGCN(Model):
     def forward(self,
                 tokens: TextFieldTensors,
                 transformer_indices: List,
-                arg_matrix: torch.Tensor,
+                adj_in: torch.Tensor,
+                adj_out: torch.Tensor,
                 aspect_span: torch.Tensor,
                 label: torch.IntTensor = None
                 ) -> Dict[str, torch.Tensor]:
@@ -69,17 +71,18 @@ class ASBIGCN(Model):
         
         # Dual-transformer structure
         Ns_lengths = torch.Tensor([len(item) for item in transformer_indices]).long().cuda()
-        S_tr, _ = self._dual_transformer(Ns, adj1, adj2, edge1, edge2, length2mask(Ns_lengths, max_Ns_len))  # b, Ns, hidden
+        # S_tr, S_g, adj_in, adj_out, mask
+        S_tr, _ = self._dual_transformer(Ns, Ns, adj_in, adj_out, length2mask(Ns_lengths, max_Ns_len))  # b, Ns, hidden
         
         # aspect span
         max_spans = max([len(spans) for spans in span_indices])
-        h_f = torch.zeros(batch_size, max_spans, self.opt.hidden_dim).float().cuda()  # (b, max_spans, hidden)
+        h_f = torch.zeros(batch_size, max_spans, S_tr.shape[2]).float().cuda()  # (b, max_spans, hidden)
         for i, spans in enumerate(span_indices):
             for j, span in enumerate(spans):
                 # MaxPooling
                 h_f[i, j], _ = torch.max(S_tr[i, span[0]:span[1]], -2)
     
-        h_f = h_f[:, 0, :]  # (b, hidden)
+        h_f = torch.max(h_f, -2)  # (b, hidden)
         h_f = self._W3(h_f)  # (b, hidden)
         
         # mask out aspects' tokens
@@ -114,11 +117,11 @@ class BiGCN(nn.Module):
         self.fc_O = nn.Linear(2*hidden_size, hidden_size)
         self._layer_norm = nn.LayerNorm(hidden_size)
     
-    def forward(self, Q_t, adj_in, adj_out):
+    def forward(self, Q_t, adj_out, adj_in):
         """
         :param Q_t: b, Ns, hidden
-        :param adj_in: b, Ns, Ns
         :param adj_out: b, Ns, Ns
+        :param adj_in: b, Ns, Ns
         :return: (b, Ns, hidden)
         """
         Q_out = self._gcn_out(Q_t, adj_out)  # b, Ns, hidden
@@ -176,101 +179,38 @@ def init_weights(module):
 
 
 class DualTransformer(nn.Module):
-    """
-    Simple GCN layer, similar to https://arxiv.org/abs/1609.02907
-    """
-    
-    def __init__(self, input_dim, output_dim, edge_size, bias=False):
+    def __init__(self, input_dim):
         super(DualTransformer, self).__init__()
-        self.T = 3
-        #        self.bertlayer=BertLayer(config)
-        #        self.bertlayer1=BertcoLayer(config)
-        #        self.bertlayer.apply(init_weights)
-        self._layer_norm = torch.nn.LayerNorm(output_dim)
-        self.edge_vocab = torch.nn.Embedding(edge_size, output_dim)
-        self._input_dim = input_dim
-        self.output_dim = output_dim
-        self.dropout = nn.Dropout(0.1)
-        #        self.dropout1 = nn.Dropout(0.0)
-        self._transform_input2output_dim = nn.Parameter(torch.FloatTensor(input_dim, output_dim))
-        self._W = torch.nn.Linear(output_dim, output_dim, bias=False)
-        #        self.linear2=torch.nn.Linear(4*out_features,out_features,bias=False)
-        self.align = SelfAlignment(output_dim)
-        #        self.align1=selfalignment(out_features)
-        #        self.align1=selfalignment(out_features)
-        #        self.align2=selfalignment(out_features)
-        self._bi_gcn = BiGCN(hidden_size=hidden_dim)
-        if bias:
-            self.bias = nn.Parameter(torch.FloatTensor(output_dim))
-        else:
-            self.register_parameter('bias', None)
+        self._transformer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        self._bi_gcn = BiGCN(hidden_size=input_dim)
+        self._bi_affine = BiAffine(hidden_size=input_dim)
+        
+        # layer norm for graph and flat
+        self._layer_norm_g = torch.nn.LayerNorm(input_dim)
+        self._layer_norm_f = torch.nn.LayerNorm(input_dim)
     
     def renorm(self, adj1, adj2):
         adj = adj1 * adj2
         adj = adj / (adj.sum(-1).unsqueeze(-1) + 1e-10)
         return adj
     
-    def forward(self, embedded_text, adj_in, adj_out, textmask):
+    def forward(self, S_tr, S_g, adj_in, adj_out, mask):
         """
-        :param embedded_text: (b, max_Ns, 768)
-        :param adj_in:
-        :param adj_out:
-        :param edge1:
-        :param edge2:
-        :param textmask:  (b, max_Ns)
+        :param S_tr: (b, max_Ns, 768)
+        :param adj_in: (b, Ns, Ns)
+        :param adj_out: (b, Ns, Ns)
+        :param mask:  (b, max_Ns)
         :return:
         """
-        adj = adj_in + adj_out
-        adj[adj >= 1] = 1
-        attss = [adj_in, adj_out]
+        # adj = adj_in + adj_out
+        # adj[adj >= 1] = 1
         
-        # Transform dimension if input and output dimensions are not equal
-        if self._input_dim != self.output_dim:
-            output = torch.relu(torch.matmul(embedded_text, self._transform_input2output_dim))
-            out = torch.relu(torch.matmul(embedded_text, self._transform_input2output_dim))
-            outss = out
-        else:
-            output = embedded_text
-            out = embedded_text
-            outss = embedded_text
-        #        outs,att1=self.align(out,out, textmask)
-        #        attss.append(att1)
-        
-        # Perform convolution
-        for _ in range(self.T):
-            #            outs=self.bertlayer(out,attention_mask=extended_attention_mask)[0]
-            #            outs,att1=self.align(out,out, textmask)
-            #            attss.append(att1)
-            outs = output
-            #            text2=output.unsqueeze(-3).repeat(1,textlen,1,1)
-            #            teout=torch.matmul(text2.unsqueeze(-2),edge).squeeze(-2)
-            #            teout=self.linear2(torch.cat([edge,text2,edge*text2,torch.abs(edge-text2)],-1))
-            
-            teout = self._W(output)
-            denom1 = torch.sum(adj, dim=2, keepdim=True) + 1
-            ##            atts=self.renorm(adj,att1)
-            output = self.dropout(torch.relu(torch.matmul(adj, teout) / denom1))
-            #            output = self.dropout(torch.relu((adj.unsqueeze(-1)*teout).sum(-2) / denom1))
-            #            denom2 = torch.sum(adj2, dim=2, keepdim=True)+1
-            ##            atts=self.renorm(adj,att1)
-            #            output2 = self.dropout(torch.relu(torch.matmul(adj2,teout) / denom2))
-            #            output=self.dropout1(torch.relu(self.linear2(torch.cat([output1,output2],-1))))
-            if self.bias is not None:
-                output = output + self.bias
-            output = self._layer_norm(output) + outs
-            outs = output
-        #            out=outs+output
-        #            output=out
-        #            outss=outs+output+self.align(output,outs, textmask)[0]*0
-        #            out=self.bertlayer1(outs,output, attention_mask=extended_attention_mask)[0]
-        #            outss=self.bertlayer1(output,outs, attention_mask=extended_attention_mask)[0]
-        #            out,_=self.align(out1,output, textmask)
-        #        out,att1=self.align1(output+outs,output+outs, textmask)
-        #        attss.append(att1)
-        outs1 = outs
-        outs, att1 = self.align(outs, outs, textmask)
-        outs = torch.cat([outs, outs1], -1)
-        return outs, attss  # b,s,h
+        S_tr1 = self._transformer(src=S_tr, src_mask=mask)
+        S_g1 = self._bi_gcn(S_g, adj_out, adj_in)
+        S_tr2, S_q2 = self._bi_affine(S_tr1, S_g1)
+        S_tr_out = self._layer_norm_f(S_tr1 + S_tr2)
+        S_g_out = self._layer_norm_g(S_g1 + S_q2)
+        return S_tr_out, S_g_out
 
 
 class biedgeGraphConvolution(nn.Module):
@@ -350,10 +290,10 @@ class biedgeGraphConvolution(nn.Module):
 
 
 class BiAffine(nn.Module):
-    def __init__(self, hidden):
+    def __init__(self, hidden_size):
         super().__init__()
-        self.W1 = nn.Linear(hidden, hidden, bias=False)
-        self.W2 = nn.Linear(hidden, hidden, bias=False)
+        self.W1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.W2 = nn.Linear(hidden_size, hidden_size, bias=False)
 
     def forward(self, S1, S2):
         """
@@ -383,8 +323,4 @@ def length2mask(lengths, max_length):
     range = range.expand_as(lengths)
     mask = range < lengths
     return mask.float().cuda()
-
-
-
-
 

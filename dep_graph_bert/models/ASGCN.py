@@ -4,7 +4,6 @@ from .layers.dynamic_rnn import DynamicLSTM
 from .layers.gcn import GraphConvolution
 
 
-
 class ASGCN(nn.Module):
     def __init__(self, embedding_matrix, opt):
         super(ASGCN, self).__init__()
