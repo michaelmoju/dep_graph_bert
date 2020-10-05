@@ -4,11 +4,12 @@ from overrides import overrides
 from allennlp.common.file_utils import cached_path
 from allennlp.data import Token
 from allennlp.data.instance import Instance
-from allennlp.data.fields import TextField, LabelField, ArrayField, SpanField
+from allennlp.data.fields import TextField, LabelField, ArrayField, SpanField, MetadataField
 from allennlp.data.dataset_readers import DatasetReader
 from allennlp.data.token_indexers import TokenIndexer
 from .dependency_graphbiedge import text_to_example, Example
 from tqdm import tqdm
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -23,11 +24,15 @@ class DgbReader(DatasetReader):
         
     def text_to_instance(self, sentence: str, target: str, polarity_label: str = None) -> Instance:
         example: Example = text_to_example(sentence, target, polarity_label)
-        text_field = TextField([Token(token.text) for token in example.spacy_document], self._token_indexers)
+        tokens = [Token(token.text) for token in example.spacy_document]
+        if len(tokens) == 0:
+            print(sentence)
+            raise RuntimeError("no sentence")
+        text_field = TextField(tokens, self._token_indexers)
         adj_in_field = ArrayField(example.adj_in)
         adj_out_field = ArrayField(example.adj_out)
-        transformer_indices = ArrayField(example.transformer_indices)
-        span_indices = ArrayField(example.span_indices)
+        transformer_indices = MetadataField(example.transformer_indices)
+        span_indices = MetadataField(example.span_indices)
         
         fields = {"tokens": text_field, "adj_in": adj_in_field, "adj_out": adj_out_field,
                   "transformer_indices": transformer_indices, "span_indices": span_indices}

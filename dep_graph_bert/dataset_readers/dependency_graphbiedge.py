@@ -45,12 +45,12 @@ def update_adj(adj, transformer_indices):
 
 def span(text_left, aspect):
     startid = 0
+    end_id = 0
     aslen = len(tokenize(aspect))
     span_indices = []
     transformer_indices = []
     for idx, text in enumerate(text_left):
         text_tokens = tokenize(text)
-        end_id = 0
         for _ in text_tokens:
             end_id = startid + 1
             transformer_indices.append([startid, end_id])
@@ -60,7 +60,7 @@ def span(text_left, aspect):
             span_indices.append([startid, end_id])
             transformer_indices.append([startid, end_id])
             startid = end_id
-    return span_indices, transformer_indices
+    return np.array(span_indices), np.array(transformer_indices)
 
 
 def dependency_adj_matrix(text, edge_vocab):
@@ -100,8 +100,8 @@ def concat(texts, aspect):
         source += text
         splitnum += len(tokenize(text))
         if i <len(texts)-1:
-           source += ' '+aspect+' '
-           splitnum += len(tokenize(aspect))
+            source += ' '+aspect+' '
+            splitnum += len(tokenize(aspect))
     if splitnum != len(tokenize(source.strip())):
         print(texts)
         print(aspect)

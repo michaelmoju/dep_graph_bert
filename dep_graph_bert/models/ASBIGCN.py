@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Dict
+from typing import Dict, List
 from allennlp.data import TextFieldTensors, Vocabulary
 from allennlp.modules.text_field_embedders import TextFieldEmbedder
 from allennlp.models import Model
@@ -19,14 +19,15 @@ class ASBIGCN(Model):
                  hidden_dim,
                  **kwargs):
         super().__init__(vocab, **kwargs)
-        out_class = vocab.get_vocab_size('label')
+        out_class = vocab.get_vocab_size('labels')
         T = 3
         self._text_embed_dropout = nn.Dropout(0.3)
         self._text_field_embedder = text_field_embedder
-        self._dual_transformer = nn.ModuleList([copy.deepcopy(DualTransformer(hidden_dim)) for _ in range(T)])
+        self._dual_transformers = nn.ModuleList([copy.deepcopy(DualTransformer(hidden_dim)) for _ in range(T)])
         self._W_plum = nn.Linear(2 * hidden_dim, hidden_dim, bias=False)
         self._W3 = torch.nn.Linear(hidden_dim, hidden_dim, bias=False)
         self._final_classifier = nn.Linear(hidden_dim, out_class)
+        self._loss_fn = nn.CrossEntropyLoss()
         self._positive_class_f1 = FBetaMeasure(average='macro')
         self._accuracy = CategoricalAccuracy()
     
@@ -34,8 +35,8 @@ class ASBIGCN(Model):
                 tokens: TextFieldTensors,
                 adj_in: torch.Tensor,
                 adj_out: torch.Tensor,
-                transformer_indices: torch.Tensor,
-                span_indices: torch.Tensor,
+                transformer_indices: List[List],
+                span_indices: List[List],
                 label: torch.IntTensor = None
                 ) -> Dict[str, torch.Tensor]:
         # embeddins
@@ -55,7 +56,11 @@ class ASBIGCN(Model):
         # Dual-transformer structure
         Ns_lengths = torch.Tensor([len(item) for item in transformer_indices]).long().cuda()
         # S_tr, S_g, adj_in, adj_out, mask
-        S_tr, _ = self._dual_transformer(Ns, Ns, adj_in, adj_out, length2mask(Ns_lengths, max_Ns_len))  # b, Ns, hidden
+        for i, l in enumerate(self._dual_transformers):
+            if i == 0:  
+                S_tr, S_g = l(Ns, Ns, adj_in, adj_out, get_padding_mask(Ns_lengths, max_Ns_len))
+            else:
+                S_tr, S_g = l(S_tr, S_g, adj_in, adj_out, get_padding_mask(Ns_lengths, max_Ns_len))
         
         # aspect span
         max_spans = max([len(spans) for spans in span_indices])
@@ -63,9 +68,10 @@ class ASBIGCN(Model):
         for i, spans in enumerate(span_indices):
             for j, span in enumerate(spans):
                 # MaxPooling
-                h_f[i, j], _ = torch.max(S_tr[i, span[0]:span[1]], -2)
+                span_mat = S_tr[i, span[0]:span[1]]
+                h_f[i, j], _ = torch.max(span_mat, dim=-2)
     
-        h_f = torch.max(h_f, -2)  # (b, hidden)
+        h_f, _ = torch.max(h_f, -2)  # (b, hidden)
         h_f = self._W3(h_f)  # (b, hidden)
         
         # mask out aspects' tokens
@@ -83,32 +89,37 @@ class ASBIGCN(Model):
         # final classifier
         h_f_last = nn.functional.relu(self._W_plum(torch.cat([h_f, S_tr_attn], -1)))  # b, hidden
         logits = self._final_classifier(h_f_last)  # (b, r_class)
-        probs = nn.functional.softmax(logits)  # (b, r_class)
+        probs = nn.functional.softmax(logits, -1)  # (b, r_class)
         output = {"logits": logits, "probs": probs}
         
         if label is not None:
+            self._accuracy(logits, label)
+            self._positive_class_f1(logits, label)
             output["loss"] = self._loss_fn(logits, label)
         
         return output
 
-    @overrides
-    def make_output_human_readable(
-            self, output_dict: Dict[str, torch.Tensor]
-    ) -> Dict[str, torch.Tensor]:
-        return output_dict
+#     @overrides
+#     def make_output_human_readable(
+#             self, output_dict: Dict[str, torch.Tensor]
+#     ) -> Dict[str, torch.Tensor]:
+#         return output_dict
 
     def get_metrics(self, reset: bool = False) -> Dict[str, float]:
+        accuracy = self._accuracy.get_metric(reset)
+        f1 = self._positive_class_f1.get_metric(reset)["fscore"]
+
         return {
-            "accuracy": self._accuracy.get_metric(reset),
-            "f1": self._positive_class_f1.get_metric(reset)
+            "accuracy": accuracy,
+            "f1": f1
         }
     
     
 class BiGCN(nn.Module):
     def __init__(self, hidden_size):
         super().__init__()
-        self._gcn_out = GraphConvolution(hidden_size, hidden_size, bias=False)
         self._gcn_in = GraphConvolution(hidden_size, hidden_size, bias=False)
+        self._gcn_out = GraphConvolution(hidden_size, hidden_size, bias=False)
         self.fc_O = nn.Linear(2*hidden_size, hidden_size)
         self._layer_norm = nn.LayerNorm(hidden_size)
     
@@ -130,7 +141,7 @@ class BiGCN(nn.Module):
 class DualTransformer(nn.Module):
     def __init__(self, input_dim):
         super(DualTransformer, self).__init__()
-        self._transformer = nn.TransformerEncoderLayer(d_model=512, nhead=8)
+        self._transformer = nn.TransformerEncoderLayer(d_model=input_dim, nhead=8)
         self._bi_gcn = BiGCN(hidden_size=input_dim)
         self._bi_affine = BiAffine(hidden_size=input_dim)
         
@@ -151,7 +162,10 @@ class DualTransformer(nn.Module):
         :param mask:  (b, max_Ns)
         :return:
         """
-        S_tr1 = self._transformer(src=S_tr, src_mask=mask)
+        S_tr = torch.transpose(S_tr, 0, 1)
+        S_tr1 = self._transformer(src=S_tr, src_key_padding_mask=mask)
+        S_tr1 = self._transformer(src=S_tr)
+        S_tr1 = torch.transpose(S_tr1, 0, 1)
         S_g1 = self._bi_gcn(S_g, adj_out, adj_in)
         S_tr2, S_q2 = self._bi_affine(S_tr1, S_g1)
         S_tr_out = self._layer_norm_f(S_tr1 + S_tr2)
@@ -172,7 +186,8 @@ class BiAffine(nn.Module):
         :return:
         """
         S2_h = self.W1(S2)  # (b, N2, hidden)
-        attn1 = torch.softmax(torch.matmul(S1, S2_h.transpose(1, 2)), dim=-1)  # (b, N1, N2)
+        matmul1 = torch.matmul(S1, torch.transpose(S2_h, 1, 2))
+        attn1 = torch.softmax(matmul1, dim=-1)  # (b, N1, N2)
         S1_out = torch.matmul(attn1, S2)  # (b, N1, hidden)
         
         S1_h = self.W2(S1)  # (b, N1, hidden)
@@ -193,4 +208,16 @@ def length2mask(lengths, max_length):
     range = range.expand_as(lengths)
     mask = range < lengths
     return mask.float().cuda()
+
+def get_padding_mask(lengths, max_length):
+    """
+    :param lengths: b
+    :param max_length
+    :return: b * max_length
+    """
+    lengths = lengths.unsqueeze(-1).repeat([1] * lengths.dim() + [max_length]).long()
+    range = torch.arange(max_length).cuda()
+    range = range.expand_as(lengths)
+    mask = range > lengths
+    return mask
 
